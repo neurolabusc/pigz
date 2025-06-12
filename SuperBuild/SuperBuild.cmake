@@ -74,6 +74,10 @@ elseif(${ZLIB_IMPLEMENTATION} STREQUAL "Custom")
     if(NOT ZLIB_ROOT)
         message(FATAL_ERROR "ZLIB_ROOT needs to be set to locate custom zlib!!!")
     endif()
+elseif(${ZLIB_IMPLEMENTATION} STREQUAL "System")
+    message("-- Build with System zlib: ON")
+else()
+    message(FATAL_ERROR "Unknown ZLIB_IMPLEMENTATION: '${ZLIB_IMPLEMENTATION}'.")
 endif()
 
 set(CMAKE_ARGS
