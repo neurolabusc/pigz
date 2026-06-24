@@ -1,6 +1,6 @@
 /* pigz.c -- parallel implementation of gzip
- * Copyright (C) 2007-2017 Mark Adler
- * Version 2.4  26 Dec 2017  Mark Adler
+ * Copyright (C) 2007-2023 Mark Adler
+ * Version 2.8  19 Aug 2023  Mark Adler
  */
 
 /*
@@ -186,9 +186,31 @@
                        Disallow an empty suffix (e.g. --suffix '')
                        Return an exit code of 1 if any issues are encountered
                        Fix sign error in compression reduction percentage
+   2.5    23 Jan 2021  Add --alias/-A option to set .zip name for stdin input
+                       Add --comment/-C option to add comment in .gz or .zip
+                       Fix a bug that misidentified a multi-entry .zip
+                       Fix a bug that did not emit double syncs for -i -p 1
+                       Fix a bug in yarn that could try to access freed data
+                       Do not delete multi-entry .zip files when extracting
+                       Do not reject .zip entries with bit 11 set
+                       Avoid a possible threads lock-order inversion
+                       Ignore trailing junk after a gzip stream by default
+   2.6     6 Feb 2021  Add --huffman/-H and --rle/U strategy options
+                       Fix issue when compiling for no threads
+                       Fail silently on a broken pipe
+   2.7    15 Jan 2022  Show time stamp only for the first gzip member
+                       Show totals when listing more than one gzip member
+                       Don't unlink input file if it has other links
+                       Add documentation for environment variables
+                       Fix bug when combining -l with -d
+                       Exit with status of zero if skipping non .gz files
+                       Permit Huffman only (-H) when not compiling with zopfli
+   2.8    19 Aug 2023  Fix version bug when compiling with zlib 1.3
+                       Save a modification time only for regular files
+                       Write all available uncompressed data on an error
  */
 
-#define VERSION "pigz 2.4\n"
+#define VERSION "pigz 2.8"
 
 /* To-do:
     - make source portable for Windows, VMS, etc. (see gzip source code)
@@ -334,6 +356,10 @@ typedef SSIZE_T ssize_t;
 
 // Use large file functions if available.
 #define _FILE_OFFSET_BITS 64
+// Portability defines.
+#define _FILE_OFFSET_BITS 64            // Use large file functions
+#define _LARGE_FILES                    // Same thing for AIX
+#define _XOPEN_SOURCE 700               // For POSIX 2008
 
 // Included headers and what is expected from each.
 #include <stdio.h>      // fflush(), fprintf(), fputs(), getchar(), putc(),
@@ -382,8 +408,12 @@ typedef SSIZE_T ssize_t;
 #if __STDC_VERSION__-0 >= 199901L || __GNUC__-0 >= 3
 #  include <inttypes.h> // intmax_t, uintmax_t
    typedef uintmax_t length_t;
+   typedef uint32_t crc_t;
+   typedef uint_least16_t prefix_t;
 #else
    typedef unsigned long length_t;
+   typedef unsigned long crc_t;
+   typedef unsigned prefix_t;
 #endif
 
 #ifdef PIGZ_DEBUG
@@ -532,8 +562,8 @@ int unlinkUTF8(const char *path) {
 #define local static
 
 // Prevent end-of-line conversions on MSDOSish operating systems.
-#if defined(MSDOS) || defined(OS2) || defined(WIN32) || defined(__CYGWIN__)
-#  include <io.h>       // setmode(), O_BINARY
+#if defined(MSDOS) || defined(OS2) || defined(_WIN32) || defined(__CYGWIN__)
+#  include <io.h>       // setmode(), O_BINARY, _commit() for _WIN32
 #  define SET_BINARY_MODE(fd) setmode(fd, O_BINARY)
 #else
 #  define SET_BINARY_MODE(fd)
@@ -610,12 +640,14 @@ int unlinkUTF8(const char *path) {
 #define INBUFS(p) (((p)<<1)+3)
 #define OUTPOOL(s) ((s)+((s)>>4)+DICT)
 
-// Input buffer size.
-#define BUF 32768U
+// Input buffer size, and augmentation for re-inserting a central header.
+#define BUF 32768
+#define CEN 42
+#define EXT (BUF + CEN)     // provide enough room to unget a header
 
 // Globals (modified by main thread only when it's the only thread).
 local struct {
-    int volatile ret;       // pigz return code
+    int ret;                // pigz return code
     char *prog;             // name by which pigz was invoked
     int ind;                // input file descriptor
     int outd;               // output file descriptor
@@ -629,32 +661,39 @@ local struct {
     int force;              // true to overwrite, compress links, cat
     int sync;               // true to flush output file
     int form;               // gzip = 0, zlib = 1, zip = 2 or 3
-    unsigned char magic1;   // first byte of possible header when decoding
+    int magic1;             // first byte of possible header when decoding
     int recurse;            // true to dive down into directory structure
     char *sufx;             // suffix to use (".gz" or user supplied)
-    char *name;             // name for gzip header
+    char *name;             // name for gzip or zip header
+    char *alias;            // name for zip header when input is stdin
+    char *comment;          // comment for gzip or zip header.
     time_t mtime;           // time stamp from input file for gzip header
     int list;               // true to list files instead of compress
     int first;              // true if we need to print listing header
     int decode;             // 0 to compress, 1 to decompress, 2 to test
     int level;              // compression level
+    int strategy;           // compression strategy
 #ifndef NOZOPFLI
     ZopfliOptions zopts;    // zopfli compression options
 #endif
     int rsync;              // true for rsync blocking
     int procs;              // maximum number of compression threads (>= 1)
+    int procs_set;          // true if -p was given explicitly on the command line
     int setdict;            // true to initialize dictionary in each thread
     size_t block;           // uncompressed input size per thread (>= 32K)
+    crc_t shift;            // pre-calculated CRC-32 shift for length block
 
     // saved gzip/zip header data for decompression, testing, and listing
     time_t stamp;           // time stamp from gzip header
     char *hname;            // name from header (allocated)
+    char *hcomm;            // comment from header (allocated)
     unsigned long zip_crc;  // local header crc
     length_t zip_clen;      // local header compressed length
     length_t zip_ulen;      // local header uncompressed length
+    int zip64;              // true if has zip64 extended information
 
     // globals for decompression and listing buffered reading
-    unsigned char in_buf[BUF];  // input buffer
+    unsigned char in_buf[EXT];  // input buffer
     unsigned char *in_next; // next unused byte in buffer
     size_t in_left;         // number of unused bytes in buffer
     int in_eof;             // true if reached end of file on input
@@ -665,7 +704,7 @@ local struct {
 
 #ifndef NOTHREAD
     // globals for decompression parallel reading
-    unsigned char in_buf2[BUF]; // second buffer for parallel reads
+    unsigned char in_buf2[EXT]; // second buffer for parallel reads
     size_t in_len;          // data waiting in next buffer
     int in_which;           // -1: start, 0: in_buf2, 1: in_buf
     lock *load_state;       // value = 0 to wait, 1 to read a buffer
@@ -673,19 +712,31 @@ local struct {
 #endif
 } g;
 
-// Display a complaint with the program name on stderr.
-local int complain(char *fmt, ...) {
-    va_list ap;
-
+local void message(char *fmt, va_list ap) {
     if (g.verbosity > 0) {
         fprintf(stderr, "%s: ", g.prog);
-        va_start(ap, fmt);
         vfprintf(stderr, fmt, ap);
-        va_end(ap);
         putc('\n', stderr);
         fflush(stderr);
     }
+}
+
+// Display a complaint with the program name on stderr.
+local int complain(char *fmt, ...) {
     g.ret = 1;
+    va_list ap;
+    va_start(ap, fmt);
+    message(fmt, ap);
+    va_end(ap);
+    return 0;
+}
+
+// Same as complain(), but don't force a bad return code.
+local int grumble(char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    message(fmt, ap);
+    va_end(ap);
     return 0;
 }
 
@@ -693,13 +744,18 @@ local int complain(char *fmt, ...) {
 
 // Memory tracking.
 
+#define MAXMEM 131072   // maximum number of tracked pointers
+
 local struct mem_track_s {
     size_t num;         // current number of allocations
     size_t size;        // total size of current allocations
+    size_t tot;         // maximum number of allocations
     size_t max;         // maximum size of allocations
 #ifndef NOTHREAD
     lock *lock;         // lock for access across threads
 #endif
+    size_t have;        // number in array (possibly != num)
+    void *mem[MAXMEM];  // sorted array of allocated pointers
 } mem_track;
 
 #ifndef NOTHREAD
@@ -710,50 +766,80 @@ local struct mem_track_s {
 #  define mem_track_drop(m)
 #endif
 
-local void *malloc_track(struct mem_track_s *mem, size_t size) {
-    void *ptr;
-
-    ptr = malloc(size);
-    if (ptr != NULL) {
-        size = MALLOC_SIZE(ptr);
-        mem_track_grab(mem);
-        mem->num++;
-        mem->size += size;
-        if (mem->size > mem->max)
-            mem->max = mem->size;
-        mem_track_drop(mem);
+// Return the leftmost insert location of ptr in the sorted list mem->mem[],
+// which currently has mem->have elements. If ptr is already in the list, the
+// returned value will point to its first occurrence. The return location will
+// be one after the last element if ptr is greater than all of the elements.
+local size_t search_track(struct mem_track_s *mem, void *ptr) {
+    ptrdiff_t left = 0;
+    ptrdiff_t right = mem->have - 1;
+    while (left <= right) {
+        ptrdiff_t mid = (left + right) >> 1;
+        if (mem->mem[mid] < ptr)
+            left = mid + 1;
+        else
+            right = mid - 1;
     }
+    return left;
+}
+
+// Insert ptr in the sorted list mem->mem[] and update the memory allocation
+// statistics.
+local void insert_track(struct mem_track_s *mem, void *ptr) {
+    mem_track_grab(mem);
+    assert(mem->have < MAXMEM && "increase MAXMEM in source and try again");
+    size_t i = search_track(mem, ptr);
+    if (i < mem->have && mem->mem[i] == ptr)
+        complain("mem_track: duplicate pointer %p\n", ptr);
+    memmove(&mem->mem[i + 1], &mem->mem[i],
+            (mem->have - i) * sizeof(void *));
+    mem->mem[i] = ptr;
+    mem->have++;
+    mem->num++;
+    mem->size += MALLOC_SIZE(ptr);
+    if (mem->num > mem->tot)
+        mem->tot = mem->num;
+    if (mem->size > mem->max)
+        mem->max = mem->size;
+    mem_track_drop(mem);
+}
+
+// Find and delete ptr from the sorted list mem->mem[] and update the memory
+// allocation statistics.
+local void delete_track(struct mem_track_s *mem, void *ptr) {
+    mem_track_grab(mem);
+    size_t i = search_track(mem, ptr);
+    if (i < mem->num && mem->mem[i] == ptr) {
+        memmove(&mem->mem[i], &mem->mem[i + 1],
+                (mem->have - (i + 1)) * sizeof(void *));
+        mem->have--;
+    }
+    else
+        complain("mem_track: missing pointer %p\n", ptr);
+    mem->num--;
+    mem->size -= MALLOC_SIZE(ptr);
+    mem_track_drop(mem);
+}
+
+local void *malloc_track(struct mem_track_s *mem, size_t size) {
+    void *ptr = malloc(size);
+    if (ptr != NULL)
+        insert_track(mem, ptr);
     return ptr;
 }
 
 local void *realloc_track(struct mem_track_s *mem, void *ptr, size_t size) {
-    size_t was;
-
     if (ptr == NULL)
         return malloc_track(mem, size);
-    was = MALLOC_SIZE(ptr);
-    ptr = realloc(ptr, size);
-    if (ptr != NULL) {
-        size = MALLOC_SIZE(ptr);
-        mem_track_grab(mem);
-        mem->size -= was;
-        mem->size += size;
-        if (mem->size > mem->max)
-            mem->max = mem->size;
-        mem_track_drop(mem);
-    }
-    return ptr;
+    delete_track(mem, ptr);
+    void *got = realloc(ptr, size);
+    insert_track(mem, got == NULL ? ptr : got);
+    return got;
 }
 
 local void free_track(struct mem_track_s *mem, void *ptr) {
-    size_t size;
-
     if (ptr != NULL) {
-        size = MALLOC_SIZE(ptr);
-        mem_track_grab(mem);
-        mem->num--;
-        mem->size -= size;
-        mem_track_drop(mem);
+        delete_track(mem, ptr);
         free(ptr);
     }
 }
@@ -778,7 +864,7 @@ local void zlib_free(voidpf opaque, voidpf address) {
 
 #define REALLOC(p, s) realloc_track(&mem_track, p, s)
 #define FREE(p) free_track(&mem_track, p)
-#define OPAQUEz (&mem_track)
+#define OPAQUE (&mem_track)
 
 
 #define ZALLOC zlib_alloc
@@ -788,7 +874,7 @@ local void zlib_free(voidpf opaque, voidpf address) {
 
 #define REALLOC realloc
 #define FREE free
-#define OPAQUEz Z_NULL
+#define OPAQUE Z_NULL
 #define ZALLOC Z_NULL
 #define ZFREE Z_NULL
 
@@ -827,7 +913,9 @@ local void log_init(void) {
     if (log_tail == NULL) {
         mem_track.num = 0;
         mem_track.size = 0;
+        mem_track.num = 0;
         mem_track.max = 0;
+        mem_track.have = 0;
 #ifndef NOTHREAD
         mem_track.lock = new_lock(0);
         yarn_mem(yarn_malloc, yarn_free);
@@ -934,11 +1022,11 @@ local void log_dump(void) {
         ;
     log_free();
     if (mem_track.num || mem_track.size)
-        complain("memory leak: %lu allocs of %lu bytes total",
+        complain("memory leak: %zu allocs of %zu bytes total",
                  mem_track.num, mem_track.size);
     if (mem_track.max)
-        fprintf(stderr, "%lu bytes of memory used\n",
-                (unsigned long)mem_track.max);
+        fprintf(stderr, "%zu bytes of memory used in %zu allocs\n",
+                mem_track.max, mem_track.tot);
 }
 
 // Debugging macro.
@@ -973,7 +1061,8 @@ local void cut_short(int sig) {
 // Common code for catch block of top routine in the thread.
 #define THREADABORT(ball) \
     do { \
-        complain("abort: %s", (ball).why); \
+        if ((ball).code != EPIPE) \
+            complain("abort: %s", (ball).why); \
         drop(ball); \
         cut_short(-(ball).code); \
     } while (0)
@@ -1053,7 +1142,7 @@ local size_t writen(int desc, void const *buf, size_t len) {
     size_t left = len;
 
     while (left) {
-        size_t const max = SIZE_MAX >> 1;       // max ssize_t
+        size_t const max = SSIZE_MAX;
         ssize_t ret = write(desc, next, left > max ? max : left);
         if (ret < 1)
             throw(errno, "write error on %s (%s)", g.outf, strerror(errno));
@@ -1136,7 +1225,7 @@ local unsigned put(int out, ...) {
 
     // write wrap[] to out and return the number of bytes written
     writen(out, wrap, count);
-    free(wrap);
+    FREE(wrap);
     return count;
 }
 
@@ -1161,13 +1250,13 @@ local length_t put_header(void) {
             4, (val_t)0,            // crc (not here)
             4, (val_t)LOW32,        // compressed length (not here)
             4, (val_t)LOW32,        // uncompressed length (not here)
-            2, (val_t)(g.name == NULL ? 1 : strlen(g.name)), // name length
+            2, (val_t)(strlen(g.name == NULL ? g.alias : g.name)),  // name len
             2, (val_t)29,           // length of extra field (see below)
             0);
 
-        // write file name (use "-" for stdin)
-        len += writen(g.outd, g.name == NULL ? "-" : g.name,
-                      g.name == NULL ? 1 : strlen(g.name));
+        // write file name (use g.alias for stdin)
+        len += writen(g.outd, g.name == NULL ? g.alias : g.name,
+                      strlen(g.name == NULL ? g.alias : g.name));
 
         // write Zip64 and extended timestamp extra field blocks (29 bytes)
         len += put(g.outd,
@@ -1182,6 +1271,8 @@ local length_t put_header(void) {
             0);
     }
     else if (g.form) {              // zlib
+        if (g.comment != NULL)
+            complain("can't store comment in zlib format -- ignoring");
         unsigned head;
         head = (0x78 << 8) +        // deflate, 32K window
                (g.level >= 9 ? 3 << 6 :
@@ -1198,13 +1289,16 @@ local length_t put_header(void) {
             1, (val_t)31,
             1, (val_t)139,
             1, (val_t)8,            // deflate
-            1, (val_t)(g.name != NULL ? 8 : 0),
+            1, (val_t)((g.name != NULL ? 8 : 0) +
+                       (g.comment != NULL ? 16 : 0)),
             4, (val_t)g.mtime,
             1, (val_t)(g.level >= 9 ? 2 : g.level == 1 ? 4 : 0),
             1, (val_t)3,            // unix
             0);
         if (g.name != NULL)
             len += writen(g.outd, g.name, strlen(g.name) + 1);
+        if (g.comment != NULL)
+            len += writen(g.outd, g.comment, strlen(g.comment) + 1);
     }
     return len;
 }
@@ -1238,18 +1332,18 @@ local void put_trailer(length_t ulen, length_t clen,
             4, (val_t)check,        // crc
             4, (val_t)(zip64 ? LOW32 : clen),   // compressed length
             4, (val_t)(zip64 ? LOW32 : ulen),   // uncompressed length
-            2, (val_t)(g.name == NULL ? 1 : strlen(g.name)), // name length
+            2, (val_t)(strlen(g.name == NULL ? g.alias : g.name)),  // name len
             2, (val_t)(zip64 ? 29 : 9), // extra field size (see below)
-            2, (val_t)0,            // no file comment
+            2, (val_t)(g.comment == NULL ? 0 : strlen(g.comment)),  // comment
             2, (val_t)0,            // disk number 0
             2, (val_t)0,            // internal file attributes
             4, (val_t)0,            // external file attributes (ignored)
             4, (val_t)0,            // offset of local header
             0);
 
-        // write file name (use "-" for stdin)
-        cent += writen(g.outd, g.name == NULL ? "-" : g.name,
-                       g.name == NULL ? 1 : strlen(g.name));
+        // write file name (use g.alias for stdin)
+        cent += writen(g.outd, g.name == NULL ? g.alias : g.name,
+                       strlen(g.name == NULL ? g.alias : g.name));
 
         // write Zip64 extra field block (20 bytes)
         if (zip64)
@@ -1267,6 +1361,10 @@ local void put_trailer(length_t ulen, length_t clen,
             1, (val_t)1,            // flag presence of mod time
             4, (val_t)g.mtime,      // mod time
             0);
+
+        // write comment, if requested
+        if (g.comment != NULL)
+            cent += writen(g.outd, g.comment, strlen(g.comment));
 
         // here zip64 is true if the offset of the central directory does not
         // fit in 32 bits, in which case insert the Zip64 end records to
@@ -1360,11 +1458,8 @@ local long zlib_vernum(void) {
         }
         ver++;
     } while (left);
-    return left < 2 ? num << (left << 2) : -1;
+    return left < 3 ? num << (left << 2) : -1;
 }
-
-#ifndef NOTHREAD
-// -- threaded portions of pigz --
 
 // -- check value combination routines for parallel calculation --
 
@@ -1375,76 +1470,53 @@ local long zlib_vernum(void) {
 // We copy the combination routines from zlib here, in order to avoid linkage
 // issues with the zlib 1.2.3 builds on Sun, Ubuntu, and others.
 
-local unsigned long gf2_matrix_times(unsigned long *mat, unsigned long vec) {
-    unsigned long sum;
+// CRC-32 polynomial, reflected.
+#define POLY 0xedb88320
 
-    sum = 0;
-    while (vec) {
-        if (vec & 1)
-            sum ^= *mat;
-        vec >>= 1;
-        mat++;
+// Return a(x) multiplied by b(x) modulo p(x), where p(x) is the CRC
+// polynomial, reflected. For speed, this requires that a not be zero.
+local crc_t multmodp(crc_t a, crc_t b) {
+    crc_t m = (crc_t)1 << 31;
+    crc_t p = 0;
+    for (;;) {
+        if (a & m) {
+            p ^= b;
+            if ((a & (m - 1)) == 0)
+                break;
+        }
+        m >>= 1;
+        b = b & 1 ? (b >> 1) ^ POLY : b >> 1;
     }
-    return sum;
+    return p;
 }
 
-local void gf2_matrix_square(unsigned long *square, unsigned long *mat) {
-    int n;
+// Table of x^2^n modulo p(x).
+local const crc_t x2n_table[] = {
+    0x40000000, 0x20000000, 0x08000000, 0x00800000, 0x00008000,
+    0xedb88320, 0xb1e6b092, 0xa06a2517, 0xed627dae, 0x88d14467,
+    0xd7bbfe6a, 0xec447f11, 0x8e7ea170, 0x6427800e, 0x4d47bae0,
+    0x09fe548f, 0x83852d0f, 0x30362f1a, 0x7b5a9cc3, 0x31fec169,
+    0x9fec022a, 0x6c8dedc4, 0x15d6874d, 0x5fde7a4e, 0xbad90e37,
+    0x2e4e5eef, 0x4eaba214, 0xa8a472c0, 0x429a969e, 0x148d302a,
+    0xc40ba6d0, 0xc4e22c3c};
 
-    for (n = 0; n < 32; n++)
-        square[n] = gf2_matrix_times(mat, mat[n]);
+// Return x^(n*2^k) modulo p(x).
+local crc_t x2nmodp(size_t n, unsigned k) {
+    crc_t p = (crc_t)1 << 31;       // x^0 == 1
+    while (n) {
+        if (n & 1)
+            p = multmodp(x2n_table[k & 31], p);
+        n >>= 1;
+        k++;
+    }
+    return p;
 }
 
+// This uses the pre-computed g.shift value most of the time. Only the last
+// combination requires a new x2nmodp() calculation.
 local unsigned long crc32_comb(unsigned long crc1, unsigned long crc2,
                                size_t len2) {
-    int n;
-    unsigned long row;
-    unsigned long even[32];     // even-power-of-two zeros operator
-    unsigned long odd[32];      // odd-power-of-two zeros operator
-
-    // degenerate case
-    if (len2 == 0)
-        return crc1;
-
-    // put operator for one zero bit in odd
-    odd[0] = 0xedb88320UL;          // CRC-32 polynomial
-    row = 1;
-    for (n = 1; n < 32; n++) {
-        odd[n] = row;
-        row <<= 1;
-    }
-
-    // put operator for two zero bits in even
-    gf2_matrix_square(even, odd);
-
-    // put operator for four zero bits in odd
-    gf2_matrix_square(odd, even);
-
-    // apply len2 zeros to crc1 (first square will put the operator for one
-    // zero byte, eight zero bits, in even)
-    do {
-        // apply zeros operator for this bit of len2
-        gf2_matrix_square(even, odd);
-        if (len2 & 1)
-            crc1 = gf2_matrix_times(even, crc1);
-        len2 >>= 1;
-
-        // if no more bits set, then done
-        if (len2 == 0)
-            break;
-
-        // another iteration of the loop with odd and even swapped
-        gf2_matrix_square(odd, even);
-        if (len2 & 1)
-            crc1 = gf2_matrix_times(odd, crc1);
-        len2 >>= 1;
-
-        // if no more bits set, then done
-    } while (len2 != 0);
-
-    // return combined crc
-    crc1 ^= crc2;
-    return crc1;
+    return multmodp(len2 == g.block ? g.shift : x2nmodp(len2, 3), crc1) ^ crc2;
 }
 
 #define BASE 65521U     // largest prime smaller than 65536
@@ -1468,6 +1540,9 @@ local unsigned long adler32_comb(unsigned long adler1, unsigned long adler2,
     if (sum2 >= BASE) sum2 -= BASE;
     return sum1 | (sum2 << 16);
 }
+
+#ifndef NOTHREAD
+// -- threaded portions of pigz --
 
 // -- pool of spaces for buffer management --
 
@@ -1522,9 +1597,9 @@ local struct space *get_space(struct pool *pool) {
     // if a space is available, pull it from the list and return it
     if (pool->head != NULL) {
         space = pool->head;
-        possess(space->use);
         pool->head = space->next;
         twist(pool->have, BY, -1);      // one less in pool
+        possess(space->use);
         twist(space->use, TO, 1);       // initially one user
         space->len = 0;
         return space;
@@ -1562,7 +1637,11 @@ local void grow_space(struct space *space) {
 // Increment the use count to require one more drop before returning this space
 // to the pool.
 local void use_space(struct space *space) {
+    long use;
+
     possess(space->use);
+    use = peek_lock(space->use);
+    assert(use != 0);
     twist(space->use, BY, +1);
 }
 
@@ -1576,6 +1655,7 @@ local void drop_space(struct space *space) {
     possess(space->use);
     use = peek_lock(space->use);
     assert(use != 0);
+    twist(space->use, BY, -1);
     if (use == 1) {
         pool = space->pool;
         possess(pool->have);
@@ -1583,7 +1663,6 @@ local void drop_space(struct space *space) {
         pool->head = space;
         twist(pool->have, BY, +1);
     }
-    twist(space->use, BY, -1);
 }
 
 // Free the memory and lock resources of a pool. Return number of spaces for
@@ -1739,25 +1818,31 @@ local void compress_thread(void *dummy) {
 #if ZLIB_VERNUM >= 0x1260
     int bits;                       // deflate pending bits
 #endif
-#ifndef NOZOPFLI
-    struct space *temp = NULL;      // temporary space for zopfli input
-#endif
     int ret;                        // zlib return code
-    z_stream strm;                  // deflate stream
     ball_t err;                     // error information from throw()
 
     (void)dummy;
 
     try {
-        // initialize the deflate stream for this thread
-        strm.zfree = ZFREE;
-        strm.zalloc = ZALLOC;
-        strm.opaque = OPAQUEz;
-        ret = deflateInit2(&strm, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY);
-        if (ret == Z_MEM_ERROR)
-            throw(ENOMEM, "not enough memory");
-        if (ret != Z_OK)
-            throw(EINVAL, "internal error");
+        z_stream strm;                  // deflate stream
+#ifndef NOZOPFLI
+        struct space *temp = NULL;
+        // get temporary space for zopfli input
+        if (g.level > 9)
+            temp = get_space(&out_pool);
+        else
+#endif
+        {
+            // initialize the deflate stream for this thread
+            strm.zfree = ZFREE;
+            strm.zalloc = ZALLOC;
+            strm.opaque = OPAQUE;
+            ret = deflateInit2(&strm, 6, Z_DEFLATED, -15, 8, g.strategy);
+            if (ret == Z_MEM_ERROR)
+                throw(ENOMEM, "not enough memory");
+            if (ret != Z_OK)
+                throw(EINVAL, "internal error");
+        }
 
         // keep looking for work
         for (;;) {
@@ -1781,14 +1866,11 @@ local void compress_thread(void *dummy) {
             if (g.level <= 9) {
 #endif
                 (void)deflateReset(&strm);
-                (void)deflateParams(&strm, g.level, Z_DEFAULT_STRATEGY);
+                (void)deflateParams(&strm, g.level, g.strategy);
 #ifndef NOZOPFLI
             }
-            else {
-                if (temp == NULL)
-                    temp = get_space(&out_pool);
+            else
                 temp->len = 0;
-            }
 #endif
 
             // set dictionary if provided, release that input or dictionary
@@ -1982,11 +2064,15 @@ local void compress_thread(void *dummy) {
         }
 
         // found job with seq == -1 -- return to join
-#ifndef NOZOPFLI
-        drop_space(temp);
-#endif
         release(compress_have);
-        (void)deflateEnd(&strm);
+#ifndef NOZOPFLI
+        if (g.level > 9)
+            drop_space(temp);
+        else
+#endif
+        {
+            (void)deflateEnd(&strm);
+        }
     }
     catch (err) {
         THREADABORT(err);
@@ -2045,6 +2131,7 @@ local void write_thread(void *dummy) {
             wait_for(job->calc, TO_BE, 1);
             release(job->calc);
             check = COMB(check, job->check, len);
+            Trace(("-- combined #%ld%s", seq, more ? "" : " (last)"));
 
             // free the job
             free_lock(job->calc);
@@ -2340,8 +2427,8 @@ local void single_compress(int reset) {
         strm = alloc(NULL, sizeof(z_stream));
         strm->zfree = ZFREE;
         strm->zalloc = ZALLOC;
-        strm->opaque = OPAQUEz;
-        ret = deflateInit2(strm, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY);
+        strm->opaque = OPAQUE;
+        ret = deflateInit2(strm, 6, Z_DEFLATED, -15, 8, g.strategy);
         if (ret == Z_MEM_ERROR)
             throw(ENOMEM, "not enough memory");
         if (ret != Z_OK)
@@ -2356,7 +2443,7 @@ local void single_compress(int reset) {
     if (g.level <= 9) {
 #endif
         (void)deflateReset(strm);
-        (void)deflateParams(strm, g.level, Z_DEFAULT_STRATEGY);
+        (void)deflateParams(strm, g.level, g.strategy);
 #ifndef NOZOPFLI
     }
 #endif
@@ -2481,10 +2568,9 @@ local void single_compress(int reset) {
                     }
                 }
                 else
-#else
-                {
                     DEFLATE_WRITE(Z_SYNC_FLUSH);
-                }
+#else
+                DEFLATE_WRITE(Z_SYNC_FLUSH);
 #endif
                 if (!g.setdict)             // two markers when independent
                     DEFLATE_WRITE(Z_FULL_FLUSH);
@@ -2664,7 +2750,7 @@ local size_t load(void) {
 }
 
 // Terminate the load() operation. Empty buffer, mark end, close file (if not
-// stdin), and free the name obtained from the header, if any.
+// stdin), and free the name and comment obtained from the header, if present.
 local void load_end(void) {
 #ifndef NOTHREAD
     // if the read thread is running, then end it
@@ -2687,6 +2773,7 @@ local void load_end(void) {
     if (g.ind != 0)
         close(g.ind);
     RELEASE(g.hname);
+    RELEASE(g.hcomm);
 }
 
 // Initialize for reading new input.
@@ -2703,7 +2790,6 @@ local void in_init(void) {
 // Buffered reading macros for decompression and listing.
 #define GET() (g.in_left == 0 && (g.in_eof || load() == 0) ? 0 : \
                (g.in_left--, *g.in_next++))
-#define UNGET(n) (g.in_left += (n), g.in_next -= (n))
 #define GET2() (tmp2 = GET(), tmp2 + ((unsigned)(GET()) << 8))
 #define GET4() (tmp4 = GET2(), tmp4 + ((unsigned long)(GET2()) << 16))
 #define SKIP(dist) \
@@ -2735,6 +2821,24 @@ local void in_init(void) {
         crc = crc32z(crc, g.in_next, togo); \
         g.in_left -= togo; \
         g.in_next += togo; \
+    } while (0)
+
+// Get a zero-terminated string into allocated memory, with crc update.
+#define GETZC(str) \
+    do { \
+        unsigned char *end; \
+        size_t copy, have, size = 0; \
+        have = 0; \
+        do { \
+            if (g.in_left == 0 && load() == 0) \
+                return -3; \
+            end = memchr(g.in_next, 0, g.in_left); \
+            copy = end == NULL ? g.in_left : (size_t)(end - g.in_next) + 1; \
+            have = vmemcpy(&str, &size, have, g.in_next, copy); \
+            g.in_left -= copy; \
+            g.in_next += copy; \
+        } while (end == NULL); \
+        crc = crc32z(crc, (unsigned char *)str, have); \
     } while (0)
 
 // Pull LSB order or MSB order integers from an unsigned char buffer.
@@ -2782,6 +2886,7 @@ local int read_extra(unsigned len, int save) {
         len -= size;
         if (id == 0x0001) {
             // Zip64 Extended Information Extra Field
+            g.zip64 = 1;
             if (g.zip_ulen == LOW32 && size >= 8) {
                 g.zip_ulen = GET4();
                 SKIP(4);
@@ -2839,26 +2944,28 @@ local int get_header(int save) {
     if (save) {
         g.stamp = 0;
         RELEASE(g.hname);
+        RELEASE(g.hcomm);
     }
 
     // see if it's a gzip, zlib, or lzw file
-    g.form = -1;
     g.magic1 = GET();
-    if (g.in_eof)
+    if (g.in_eof) {
+        g.magic1 = -1;
         return -1;
+    }
     magic = (unsigned)g.magic1 << 8;
     magic += GET();
-    if (g.in_eof) {
-        UNGET(1);
+    if (g.in_eof)
         return -2;
-    }
     if (magic % 31 == 0 && (magic & 0x8f20) == 0x0800) {
         // it's zlib
         g.form = 1;
         return 8;
     }
-    if (magic == 0x1f9d)            // it's lzw
+    if (magic == 0x1f9d) {          // it's lzw
+        g.form = -1;
         return 257;
+    }
     if (magic == 0x504b) {          // it's zip
         magic = GET2();             // the rest of the signature
         if (g.in_eof)
@@ -2867,9 +2974,10 @@ local int get_header(int save) {
             return -5;              // central header or archive extra
         if (magic != 0x0403)
             return -4;              // not a local header
+        g.zip64 = 0;
         SKIP(2);
         flags = GET2();
-        if (flags & 0xfff0)
+        if (flags & 0xf7f0)
             return -4;
         method = GET();             // return low byte of method or 256
         if (GET() != 0 || flags & 1)
@@ -2909,7 +3017,8 @@ local int get_header(int save) {
         return g.in_eof ? -3 : (int)method;
     }
     if (magic != 0x1f8b) {          // not gzip
-        UNGET(2);
+        g.in_left++;                // return the second byte
+        g.in_next--;
         return -2;
     }
 
@@ -2934,29 +3043,22 @@ local int get_header(int save) {
         SKIPC(GET2C());
 
     // read file name, if present, into allocated memory
-    if ((flags & 8) && save) {
-        unsigned char *end;
-        size_t copy, have, size = 0;
-        have = 0;
-        do {
-            if (g.in_left == 0 && load() == 0)
-                return -3;
-            end = memchr(g.in_next, 0, g.in_left);
-            copy = end == NULL ? g.in_left : (size_t)(end - g.in_next) + 1;
-            have = vmemcpy(&g.hname, &size, have, g.in_next, copy);
-            g.in_left -= copy;
-            g.in_next += copy;
-        } while (end == NULL);
-        crc = crc32z(crc, (unsigned char *)g.hname, have);
+    if (flags & 8) {
+        if (save)
+            GETZC(g.hname);
+        else
+            while (GETC() != 0)
+                ;
     }
-    else if (flags & 8)
-        while (GETC() != 0)
-            ;
 
-    // skip comment
-    if (flags & 16)
-        while (GETC() != 0)
-            ;
+    // read comment, if present, into allocated memory
+    if (flags & 16) {
+        if (save)
+            GETZC(g.hcomm);
+        else
+            while (GETC() != 0)
+                ;
+    }
 
     // check header crc
     if ((flags & 2) && GET2() != (crc & 0xffff))
@@ -2965,6 +3067,122 @@ local int get_header(int save) {
     // return gzip compression method
     g.form = 0;
     return g.in_eof ? -3 : (int)method;
+}
+
+// Process the remainder of a zip file after the first entry. Return true if
+// the next signature is another local file header. If listing verbosely, then
+// search the remainder of the zip file for the central file header
+// corresponding to the first zip entry, and save the file comment, if any.
+local int more_zip_entries(void) {
+    unsigned long sig;
+    int ret, n;
+    unsigned char *first;
+    unsigned tmp2;              // for macro
+    unsigned long tmp4;         // for macro
+    unsigned char const central[] = {0x50, 0x4b, 1, 2};
+
+    sig = GET4();
+    ret = !g.in_eof && sig == 0x04034b50;   // true if another entry follows
+    if (!g.list || g.verbosity < 2)
+        return ret;
+
+    // if it was a central file header signature, then already four bytes
+    // into a central directory header -- otherwise search for the next one
+    n = sig == 0x02014b50 ? 4 : 0;  // number of bytes into central header
+    for (;;) {
+        // assure that more input is available
+        if (g.in_left == 0 && load() == 0)      // never found it!
+            return ret;
+        if (n == 0) {
+            // look for first byte in central signature
+            first = memchr(g.in_next, central[0], g.in_left);
+            if (first == NULL) {
+                // not found -- go get the next buffer and keep looking
+                g.in_left = 0;
+            }
+            else {
+                // found -- continue search at next byte
+                n++;
+                g.in_left -= first - g.in_next + 1;
+                g.in_next = first + 1;
+            }
+        }
+        else if (n < 4) {
+            // look for the remaining bytes in the central signature
+            if (g.in_next[0] == central[n]) {
+                n++;
+                g.in_next++;
+                g.in_left--;
+            }
+            else
+                n = 0;      // mismatch -- restart search with this byte
+        }
+        else {
+            // Now in a suspected central file header, just past the signature.
+            // Read the rest of the fixed-length portion of the header.
+            unsigned char head[CEN];
+            size_t need = CEN, part = 0, len, i;
+
+            if (need > g.in_left) {     // will only need to do this once
+                part = g.in_left;
+                memcpy(head + CEN - need, g.in_next, part);
+                need -= part;
+                g.in_left = 0;
+                if (load() == 0)                // never found it!
+                    return ret;
+            }
+            memcpy(head + CEN - need, g.in_next, need);
+
+            // Determine to sufficient probability that this is the droid we're
+            // looking for, by checking the CRC and the local header offset.
+            if (PULL4L(head + 12) == g.out_check && PULL4L(head + 38) == 0) {
+                // Update the number of bytes consumed from the current buffer.
+                g.in_next += need;
+                g.in_left -= need;
+
+                // Get the comment length.
+                len = PULL2L(head + 28);
+                if (len == 0)                   // no comment
+                    return ret;
+
+                // Skip the file name and extra field.
+                SKIP(PULL2L(head + 24) + (unsigned long)PULL2L(head + 26));
+
+                // Save the comment field.
+                need = len;
+                g.hcomm = alloc(NULL, len + 1);
+                while (need > g.in_left) {
+                    memcpy(g.hcomm + len - need, g.in_next, g.in_left);
+                    need -= g.in_left;
+                    g.in_left = 0;
+                    if (load() == 0) {          // premature EOF
+                        RELEASE(g.hcomm);
+                        return ret;
+                    }
+                }
+                memcpy(g.hcomm + len - need, g.in_next, need);
+                g.in_next += need;
+                g.in_left -= need;
+                for (i = 0; i < len; i++)
+                    if (g.hcomm[i] == 0)
+                        g.hcomm[i] = ' ';
+                g.hcomm[len] = 0;
+                return ret;
+            }
+            else {
+                // Nope, false alarm. Restart the search at the first byte
+                // after what we thought was the central file header signature.
+                if (part) {
+                    // Move buffer data up and insert the part of the header
+                    // data read from the previous buffer.
+                    memmove(g.in_next + part, g.in_next, g.in_left);
+                    memcpy(g.in_next, head, part);
+                    g.in_left += part;
+                }
+                n = 0;
+            }
+        }
+    }
 }
 
 // --- list contents of compressed input (gzip, zlib, or lzw) ---
@@ -3001,7 +3219,7 @@ local size_t compressed_suffix(char *nm) {
 #define NAMEMAX1 48     // name display limit at verbosity 1
 #define NAMEMAX2 16     // name display limit at verbosity 2
 
-// Print gzip or lzw file information.
+// Print gzip, lzw, zlib, or zip file information.
 local void show_info(int method, unsigned long check, length_t len, int cont) {
     size_t max;             // maximum name length for current verbosity
     size_t n;               // name length without suffix
@@ -3016,7 +3234,7 @@ local void show_info(int method, unsigned long check, length_t len, int cont) {
         strncpy(tag, "<...>", max + 1);
     else if (g.hname == NULL) {
         n = strlen(g.inf) - compressed_suffix(g.inf);
-        strncpy(tag, g.inf, n > max + 1 ? max + 1 : n);
+        memcpy(tag, g.inf, n > max + 1 ? max + 1 : n);
         if (strcmp(g.inf + n, ".tgz") == 0 && n < max + 1)
             strncpy(tag + n, ".tar", max + 1 - n);
     }
@@ -3026,7 +3244,7 @@ local void show_info(int method, unsigned long check, length_t len, int cont) {
         strcpy(tag + max - 3, "...");
 
     // convert time stamp to text
-    if (g.stamp) {
+    if (g.stamp && !cont) {
         strcpy(mod, ctime(&g.stamp));
         now = time(NULL);
         if (strcmp(mod + 20, ctime(&now) + 20) != 0)
@@ -3065,21 +3283,17 @@ local void show_info(int method, unsigned long check, length_t len, int cont) {
             (method == 8 && g.in_tot > (len + (len >> 10) + 12)) ||
             (method == 257 && g.in_tot > len + (len >> 1) + 3))
 #if __STDC_VERSION__-0 >= 199901L || __GNUC__-0 >= 3
-            printf("%10jd %10jd?  unk    %s\n",
-                   (intmax_t)g.in_tot, (intmax_t)len, tag);
+            printf("%10ju %10ju?  unk    %s\n", g.in_tot, len, tag);
         else
-            printf("%10jd %10jd %6.1f%%  %s\n",
-                   (intmax_t)g.in_tot, (intmax_t)len, red, tag);
+            printf("%10ju %10ju %6.1f%%  %s\n", g.in_tot, len, red, tag);
 #else
-            printf(sizeof(off_t) == sizeof(long) ?
-                   "%10ld %10ld?  unk    %s\n" : "%10lld %10lld?  unk    %s\n",
-                   g.in_tot, len, tag);
+            printf("%10lu %10lu?  unk    %s\n", g.in_tot, len, tag);
         else
-            printf(sizeof(off_t) == sizeof(long) ?
-                   "%10ld %10ld %6.1f%%  %s\n" : "%10lld %10lld %6.1f%%  %s\n",
-                   g.in_tot, len, red, tag);
+            printf("%10lu %10lu %6.1f%%  %s\n", g.in_tot, len, red, tag);
 #endif
     }
+    if (g.verbosity > 1 && g.hcomm != NULL)
+        puts(g.hcomm);
 }
 
 // List content information about the gzip file at ind (only works if the gzip
@@ -3113,6 +3327,7 @@ local void list_info(void) {
 
     // list zip file
     if (g.form > 1) {
+        more_zip_entries();         // get first entry comment, if any
         g.in_tot = g.zip_clen;
         show_info(method, g.zip_crc, g.zip_ulen, 0);
         return;
@@ -3206,6 +3421,12 @@ local void list_info(void) {
 // --- copy input to output (when acting like cat) ---
 
 local void cat(void) {
+    // copy the first header byte read, if any
+    if (g.magic1 != -1) {
+        unsigned char buf[1] = {g.magic1};
+        g.out_tot += writen(g.outd, buf, 1);
+    }
+
     // copy the remainder of the input to the output
     while (g.in_left) {
         g.out_tot += writen(g.outd, g.in_next, g.in_left);
@@ -3216,20 +3437,12 @@ local void cat(void) {
 
 // --- decompress deflate input ---
 
-// Call-back input function for inflateBack().
-local unsigned inb(void *desc, unsigned char **buf) {
-    (void)desc;
-    if (g.in_left == 0)
-        load();
-    *buf = g.in_next;
-    unsigned len = g.in_left > UINT_MAX ? UINT_MAX : (unsigned)g.in_left;
-    g.in_next += len;
-    g.in_left -= len;
-    return len;
-}
-
-// Output buffers and window for infchk() and unlzw().
-#define OUTSIZE 32768U      // must be at least 32K for inflateBack() window
+// Output buffers for infchk() and unlzw(). infchk() uses inflate() rather than
+// inflateBack(), so the output buffer is not tied to the 32K deflate window: a
+// large buffer keeps the optimized fast inflate path (large avail_out) active
+// and minimizes write/check thread hand-offs. This is standard zlib API and
+// benefits every backend (system, Cloudflare, zlib-ng).
+#define OUTSIZE 262144U
 local unsigned char out_buf[OUTSIZE];
 
 #ifndef NOTHREAD
@@ -3296,6 +3509,8 @@ local void outb_check(void *dummy) {
 // write and check threads and return for more decompression while that's going
 // on (or just write and check if no threads or if proc == 1).
 local int outb(void *desc, unsigned char *buf, unsigned len) {
+    (void)desc;
+
 #ifndef NOTHREAD
     static thread *wr, *ch;
 
@@ -3316,22 +3531,18 @@ local int outb(void *desc, unsigned char *buf, unsigned len) {
 
         // copy the output and alert the worker bees
         out_len = len;
-        g.out_tot += len;
-        memcpy(out_copy, buf, len);
+        if (len) {
+            g.out_tot += len;
+            memcpy(out_copy, buf, len);
+        }
         twist(outb_write_more, TO, 1);
         twist(outb_check_more, TO, 1);
 
         // if requested with len == 0, clean up -- terminate and join write and
         // check threads, free lock
         if (len == 0 && outb_write_more != NULL) {
-            if (desc != NULL) {
-                destruct(ch);
-                destruct(wr);
-            }
-            else {
-                join(ch);
-                join(wr);
-            }
+            join(ch);
+            join(wr);
             free_lock(outb_check_more);
             free_lock(outb_write_more);
             outb_write_more = NULL;
@@ -3344,8 +3555,6 @@ local int outb(void *desc, unsigned char *buf, unsigned len) {
     }
 #endif
 
-    (void)desc;
-
     // if just one process or no threads, then do it without threads
     if (len) {
         if (g.decode == 1)
@@ -3356,19 +3565,26 @@ local int outb(void *desc, unsigned char *buf, unsigned len) {
     return 0;
 }
 
+// Zip file data descriptor signature. This signature may or may not precede
+// the CRC and lengths, with either resulting in a valid zip file! There is
+// some odd code below that tries to detect and accommodate both cases.
+#define SIG 0x08074b50
+
 // Inflate for decompression or testing. Decompress from ind to outd unless
 // decode != 1, in which case just test ind, and then also list if list != 0;
 // look for and decode multiple, concatenated gzip and/or zlib streams; read
 // and check the gzip, zlib, or zip trailer.
 local void infchk(void) {
-    int ret, cont, was;
-    unsigned long check, len;
+    int ret, cont, more;
+    unsigned long check, len, ktot;
     z_stream strm;
     unsigned tmp2;
     unsigned long tmp4;
-    length_t clen;
+    length_t clen, ctot, utot;
 
-    cont = 0;
+    ctot = utot = 0;
+    ktot = CHECK(0L, Z_NULL, 0);
+    cont = more = 0;
     do {
         // header already read -- set up for decompression
         g.in_tot = g.in_left;       // track compressed data length
@@ -3376,28 +3592,57 @@ local void infchk(void) {
         g.out_check = CHECK(0L, Z_NULL, 0);
         strm.zalloc = ZALLOC;
         strm.zfree = ZFREE;
-        strm.opaque = OPAQUEz;
-        ret = inflateBackInit(&strm, 15, out_buf);
+        strm.opaque = OPAQUE;
+        strm.avail_in = 0;
+        strm.next_in = Z_NULL;
+        ret = inflateInit2(&strm, -15);     // raw inflate; header already read
         if (ret == Z_MEM_ERROR)
             throw(ENOMEM, "not enough memory");
         if (ret != Z_OK)
             throw(EINVAL, "internal error");
 
-        // decompress, compute lengths and check value
-        strm.avail_in = 0;
-        strm.next_in = Z_NULL;
-        ret = inflateBack(&strm, inb, NULL, outb, NULL);
-        inflateBackEnd(&strm);
+        // decompress into a large buffer, computing lengths and check value.
+        // Using inflate() instead of inflateBack() frees the output from the
+        // 32K window, keeping the fast inflate path active for all backends.
+        do {
+            // provide more input if the current chunk is exhausted
+            if (strm.avail_in == 0) {
+                if (g.in_left == 0)
+                    load();
+                if (g.in_left == 0)
+                    break;              // premature end of input
+                strm.next_in = g.in_next;
+                strm.avail_in = g.in_left > UINT_MAX ? UINT_MAX :
+                                (unsigned)g.in_left;
+                g.in_next += strm.avail_in;
+                g.in_left -= strm.avail_in;
+            }
+
+            // inflate available input, handing each filled (or final) buffer to
+            // outb() for writing and check-value calculation
+            do {
+                strm.next_out = out_buf;
+                strm.avail_out = OUTSIZE;
+                ret = inflate(&strm, Z_NO_FLUSH);
+                if (ret == Z_STREAM_ERROR || ret == Z_NEED_DICT)
+                    ret = Z_DATA_ERROR;
+                if (ret == Z_MEM_ERROR)
+                    throw(ENOMEM, "not enough memory");
+                if (OUTSIZE - strm.avail_out)
+                    outb(NULL, out_buf, OUTSIZE - strm.avail_out);
+            } while (strm.avail_out == 0 && ret == Z_OK);
+        } while (ret == Z_OK || ret == Z_BUF_ERROR);
+
+        // return unused input for the trailer, finish output, clean up
+        g.in_left += strm.avail_in;
+        g.in_next = strm.next_in;
+        inflateEnd(&strm);
+        outb(NULL, NULL, 0);        // finish off final write and check
         if (ret == Z_DATA_ERROR)
             throw(EDOM, "%s: corrupted -- invalid deflate data (%s)",
                   g.inf, strm.msg);
-        if (ret == Z_BUF_ERROR)
-            throw(EDOM, "%s: corrupted -- incomplete deflate data", g.inf);
         if (ret != Z_STREAM_END)
-            throw(EINVAL, "internal error");
-        g.in_left += strm.avail_in;
-        g.in_next = strm.next_in;
-        outb(NULL, NULL, 0);        // finish off final write and check
+            throw(EDOM, "%s: corrupted -- incomplete deflate data", g.inf);
 
         // compute compressed data length
         clen = g.in_tot - g.in_left;
@@ -3405,36 +3650,56 @@ local void infchk(void) {
         // read and check trailer
         if (g.form > 1) {           // zip local trailer (if any)
             if (g.form == 3) {      // data descriptor follows
-                // read original version of data descriptor
+                // get data descriptor values, assuming no signature
                 g.zip_crc = GET4();
                 g.zip_clen = GET4();
-                g.zip_ulen = GET4();
-                if (g.in_eof)
-                    throw(EDOM, "%s: corrupted entry -- missing trailer",
-                          g.inf);
+                g.zip_ulen = GET4();        // ZIP64 -> high clen, not ulen
 
-                // if crc doesn't match, try info-zip variant with sig
-                if (g.zip_crc != g.out_check) {
-                    if (g.zip_crc != 0x08074b50UL || g.zip_clen != g.out_check)
-                        throw(EDOM, "%s: corrupted entry -- crc32 mismatch",
-                              g.inf);
+                // deduce whether or not a signature precedes the values
+                if (g.zip_crc == SIG &&         // might be the signature
+                    // if the expected CRC is not SIG, then it's a signature
+                    (g.out_check != SIG ||      // assume signature
+                     // now we're in a very rare case where CRC == SIG -- the
+                     // first four bytes could be the signature or the CRC
+                     (g.zip_clen == SIG &&      // if not, then no signature
+                      // now we have the first two words are SIG and the
+                      // expected CRC is SIG, so it could be a signature and
+                      // the CRC, or it could be the CRC and a compressed
+                      // length that is *also* SIG (!) -- so check the low 32
+                      // bits of the expected compressed length for SIG
+                      ((clen & LOW32) != SIG || // assume signature and CRC
+                       // now the expected CRC *and* the expected low 32 bits
+                       // of the compressed length are SIG -- this is so
+                       // incredibly unlikely, clearly someone is messing with
+                       // us, but we continue ... if the next four bytes are
+                       // not SIG, then there is not a signature -- check those
+                       // bytes, currently in g.zip_ulen:
+                       (g.zip_ulen == SIG &&    // if not, then no signature
+                        // we have three SIGs in a row in the descriptor, and
+                        // both the expected CRC and the expected clen are SIG
+                        // -- the first one is a signature if we don't expect
+                        // the third word to be SIG, which is either the low 32
+                        // bits of ulen, or if ZIP64, the high 32 bits of clen:
+                        (g.zip64 ? clen >> 32 : g.out_tot) != SIG
+                        // if that last compare was equal, then the expected
+                        // values for the CRC, the low 32 bits of clen, *and*
+                        // the low 32 bits of ulen are all SIG (!!), or in the
+                        // case of ZIP64, even crazier, the CRC and *both*
+                        // 32-bit halves of clen are all SIG (clen > 500
+                        // petabytes!!!) ... we can no longer discriminate the
+                        // hypotheses, so we will assume no signature
+                        ))))) {
+                    // first four bytes were actually the descriptor -- shift
+                    // the values down and get another four bytes
                     g.zip_crc = g.zip_clen;
                     g.zip_clen = g.zip_ulen;
                     g.zip_ulen = GET4();
                 }
 
-                // handle incredibly rare cases where crc equals signature
-                else if (g.zip_crc == 0x08074b50UL &&
-                         g.zip_clen == g.zip_crc &&
-                         ((clen & LOW32) != g.zip_crc ||
-                          g.zip_ulen == g.zip_crc)) {
-                    g.zip_crc = g.zip_clen;
-                    g.zip_clen = g.zip_ulen;
-                    g.zip_ulen = GET4();
-                }
-
-                // if second length doesn't match, try 64-bit lengths
-                if (g.zip_ulen != (g.out_tot & LOW32)) {
+                // if ZIP64, then ulen is really the high word of clen -- get
+                // the actual ulen and skip its high word as well (we only
+                // compare the low 32 bits of the lengths to verify)
+                if (g.zip64) {
                     g.zip_ulen = GET4();
                     (void)GET4();
                 }
@@ -3442,11 +3707,14 @@ local void infchk(void) {
                     throw(EDOM, "%s: corrupted entry -- missing trailer",
                           g.inf);
             }
+            check = g.zip_crc;
+            if (check != g.out_check)
+                throw(EDOM, "%s: corrupted entry -- crc32 mismatch", g.inf);
             if (g.zip_clen != (clen & LOW32) ||
                 g.zip_ulen != (g.out_tot & LOW32))
                 throw(EDOM, "%s: corrupted entry -- length mismatch",
                       g.inf);
-            check = g.zip_crc;
+            more = more_zip_entries();  // see if more entries, get comment
         }
         else if (g.form == 1) {     // zlib (big-endian) trailer
             check = (unsigned long)(GET()) << 24;
@@ -3471,23 +3739,45 @@ local void infchk(void) {
 
         // show file information if requested
         if (g.list) {
+            ctot += clen;
+            utot += g.out_tot;
+            ktot = COMB(ktot, check, g.out_tot);
             g.in_tot = clen;
             show_info(8, check, g.out_tot, cont);
-            cont = 1;
+            cont = cont ? 2 : 1;
         }
 
         // if a gzip entry follows a gzip entry, decompress it (don't replace
         // saved header information from first entry)
-        was = g.form;
-    } while (was == 0 && (ret = get_header(0)) == 8 && g.form == 0);
+    } while (g.form == 0 && (ret = get_header(0)) == 8);
+
+    // show totals if more than one gzip member
+    if (cont > 1 && g.verbosity > 0) {
+        if (g.verbosity > 1)
+            printf("        %08lx                ", ktot);
+        printf(
+#if __STDC_VERSION__-0 >= 199901L || __GNUC__-0 >= 3
+               "%10ju %10ju %6.1f%%  (total)\n",
+#else
+               "%10lu %10lu %6.1f%%  (total)\n",
+#endif
+               ctot, utot, 100. * (utot - (double)ctot) / utot);
+    }
 
     // gzip -cdf copies junk after gzip stream directly to output
-    if (was == 0 && ret == -2 && g.force && g.pipeout && g.decode != 2 &&
+    if (g.form == 0 && ret == -2 && g.force && g.pipeout && g.decode != 2 &&
         !g.list)
         cat();
-    else if (was > 1 && get_header(0) != -5)
+
+    // check for more entries in zip file
+    else if (more) {
         complain("warning: %s: entries after the first were ignored", g.inf);
-    else if ((was == 0 && ret != -1) || (was == 1 && (GET(), !g.in_eof)))
+        g.keep = 1;         // don't delete the .zip file
+    }
+
+    // check for non-gzip after gzip stream, or anything after zlib stream
+    else if ((g.verbosity > 1 && g.form == 0 && ret != -1) ||
+             (g.form == 1 && (GET(), !g.in_eof)))
         complain("warning: %s: trailing junk was ignored", g.inf);
 }
 
@@ -3519,7 +3809,7 @@ local void unlzw(void) {
     // memory for unlzw() -- the first 256 entries of prefix[] and suffix[] are
     // never used, so could have offset the index but it's faster to waste a
     // little memory
-    uint_least16_t prefix[65536];       // index to LZW prefix string
+    prefix_t prefix[65536];             // index to LZW prefix string
     unsigned char suffix[65536];        // one-character LZW suffix
     unsigned char match[65280 + 2];     // buffer for reversed match
 
@@ -3665,7 +3955,7 @@ local void unlzw(void) {
             // link new table entry
             if (end < mask) {
                 end++;
-                prefix[end] = (uint_least16_t)prev;
+                prefix[end] = (prefix_t)prev;
                 suffix[end] = (unsigned char)final;
             }
 
@@ -3703,36 +3993,32 @@ local char *justname(char *path) {
     return p == NULL ? path : p + 1;
 }
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-result"
-
 // Copy file attributes, from -> to, as best we can. This is best effort, so no
 // errors are reported. The mode bits, including suid, sgid, and the sticky bit
 // are copied (if allowed), the owner's user id and group id are copied (again
 // if allowed), and the access and modify times are copied.
-local void copymeta(char *from, char *to) {
+local int copymeta(char *from, char *to) {
     struct stat st;
     struct timeval times[2];
 
     // get all of from's Unix meta data, return if not a regular file
     if (stat(from, &st) != 0 || (st.st_mode & S_IFMT) != S_IFREG)
-        return;
+        return -4;
 
     // set to's mode bits, ignore errors
-    (void)chmod(to, st.st_mode & 07777);
+    int ret = chmod(to, st.st_mode & 07777);
 
     // copy owner's user and group, ignore errors
-    (void)chown(to, st.st_uid, st.st_gid);
+    ret += chown(to, st.st_uid, st.st_gid);
 
     // copy access and modify times, ignore errors
     times[0].tv_sec = st.st_atime;
     times[0].tv_usec = 0;
     times[1].tv_sec = st.st_mtime;
     times[1].tv_usec = 0;
-    (void)utimes(to, times);
+    ret += utimes(to, times);
+    return ret;
 }
-
-#pragma GCC diagnostic pop
 
 // Set the access and modify times of fd to t.
 local void touch(char *path, time_t t) {
@@ -3818,17 +4104,14 @@ int fsync (int fd) {
 // memory on the device itself, leaving open a window of vulnerability.
 // fcntl(fd, F_FULLSYNC) on the other hand, available in macOS only, will
 // request and wait for the device to write out its buffered data to permanent
-// storage.
-//
-// For a future Windows port of pigz, winbase.h should be included and
-// FlushFileBuffers() used, which also waits for the device write out its
-// buffered data to permanent storage.
+// storage. On Windows, _commit() is used.
 local void out_push(void) {
     if (g.outd == -1)
         return;
-#ifdef _MSC_VER
-   //int ret = fcntl(g.outd, F_FULLFSYNC);
-   int ret = fsync(g.outd);
+#if defined(F_FULLSYNC)
+    int ret = fcntl(g.outd, F_FULLSYNC);
+#elif defined(_WIN32)
+    int ret = _commit(g.outd);
 #else
 
  #ifdef F_FULLSYNC
@@ -3857,8 +4140,8 @@ local void process(char *path) {
         vstrcpy(&g.inf, &g.inz, 0, "<stdin>");
         g.ind = 0;
         g.name = NULL;
-        g.mtime = g.headis & 2 ?
-                  (fstat(g.ind, &st) ? time(NULL) : st.st_mtime) : 0;
+        g.mtime = (g.headis & 2) && fstat(g.ind, &st) == 0 &&
+                  S_ISREG(st.st_mode) ? st.st_mtime : 0;
         len = 0;
     }
     else {
@@ -3949,7 +4232,7 @@ local void process(char *path) {
         // don't compress .gz (or provided suffix) files, unless -f
         if (!(g.force || g.list || g.decode) && len >= strlen(g.sufx) &&
                 strcmp(g.inf + len - strlen(g.sufx), g.sufx) == 0) {
-            complain("skipping: %s ends with %s", g.inf, g.sufx);
+            grumble("skipping: %s ends with %s", g.inf, g.sufx);
             return;
         }
 
@@ -3974,6 +4257,13 @@ local void process(char *path) {
         g.mtime = g.headis & 2 ? st.st_mtime : 0;
     }
     SET_BINARY_MODE(g.ind);
+
+    // if requested, just list information about the input file
+    if (g.list && g.decode != 2) {
+        list_info();
+        load_end();
+        return;
+    }
 
     // if decoding or testing, try to read gzip header
     if (g.decode) {
@@ -4009,18 +4299,11 @@ local void process(char *path) {
                     punt(err);
                 complain("skipping: %s", err.why);
                 drop(err);
-                outb(&g, NULL, 0);
+                outb(NULL, NULL, 0);
             }
             load_end();
             return;
         }
-    }
-
-    // if requested, just list information about input file
-    if (g.list) {
-        list_info();
-        load_end();
-        return;
     }
 
     // create output file out, descriptor outd
@@ -4054,7 +4337,8 @@ local void process(char *path) {
             // add appropriate suffix when compressing
             sufx = g.sufx;
 
-        // create output file and open to write
+        // create output file and open to write, overwriting any existing file
+        // of the same name only if requested with --force or -f
         g.outf = alloc(NULL, pre + len + strlen(sufx) + 1);
         memcpy(g.outf, g.inf, pre);
         memcpy(g.outf + pre, to, len);
@@ -4062,29 +4346,33 @@ local void process(char *path) {
         g.outd = openUTF8(g.outf, O_CREAT | O_TRUNC | O_WRONLY |
                               (g.force ? 0 : O_EXCL), 0600);
 
-        // if exists and not -f, give user a chance to overwrite
-        if (g.outd < 0 && errno == EEXIST && isatty(0) && g.verbosity) {
-            int ch, reply;
-
-            fprintf(stderr, "%s exists -- overwrite (y/n)? ", g.outf);
-            fflush(stderr);
-            reply = -1;
-            do {
-                ch = getchar();
-                if (reply < 0 && ch != ' ' && ch != '\t')
-                    reply = ch == 'y' || ch == 'Y' ? 1 : 0;
-            } while (ch != EOF && ch != '\n' && ch != '\r');
-            if (reply == 1)
-                g.outd = openUTF8(g.outf, O_CREAT | O_TRUNC | O_WRONLY,
-                              0600);
-        }
-
-        // if exists and no overwrite, report and go on to next
+        // if it exists and wasn't forced, give the user a chance to overwrite
         if (g.outd < 0 && errno == EEXIST) {
-            complain("skipping: %s exists", g.outf);
-            RELEASE(g.outf);
-            load_end();
-            return;
+            int overwrite = 0;
+            if (isatty(0) && g.verbosity) {
+                // get a response from the user -- the first non-blank
+                // character has to be a "y" or a "Y" to permit an overwrite
+                fprintf(stderr, "%s exists -- overwrite (y/n)? ", g.outf);
+                fflush(stderr);
+                int ch, first = 1;
+                do {
+                    ch = getchar();
+                    if (first == 1) {
+                        if (ch == ' ' || ch == '\t')
+                            continue;
+                        if (ch == 'y' || ch == 'Y')
+                            overwrite = 1;
+                        first = 0;
+                    }
+                } while (ch != EOF && ch != '\n' && ch != '\r');
+            }
+            if (!overwrite) {
+                complain("skipping: %s exists", g.outf);
+                RELEASE(g.outf);
+                load_end();
+                return;
+            }
+            g.outd = open(g.outf, O_CREAT | O_TRUNC | O_WRONLY, 0600);
         }
 
         // if some other error, give up
@@ -4110,7 +4398,7 @@ local void process(char *path) {
                 punt(err);
             complain("skipping: %s", err.why);
             drop(err);
-            outb(g.outf, NULL, 0);
+            outb(NULL, NULL, 0);
             if (g.outd != -1 && g.outd != 1) {
                 close(g.outd);
                 g.outd = -1;
@@ -4140,8 +4428,12 @@ local void process(char *path) {
         g.outd = -1;            // now prevent deletion on interrupt
         if (g.ind != 0) {
             copymeta(g.inf, g.outf);
-            if (!g.keep)
-                unlinkUTF8(g.inf);
+            if (!g.keep) {
+                if (st.st_nlink > 1 && !g.force)
+                    complain("%s has hard links -- not unlinking", g.inf);
+                else
+                    unlinkUTF8(g.inf);
+            }
         }
         if (g.decode && (g.headis & 2) != 0 && g.stamp)
             touch(g.outf, g.stamp);
@@ -4166,14 +4458,17 @@ local char *helptext[] = {
 "  -0 to -9, -11        Compression level (level 11, zopfli, is much slower)",
 #endif
 "  --fast, --best       Compression levels 1 and 9 respectively",
+"  -A, --alias xxx      Use xxx as the name for any --zip entry from stdin",
 "  -b, --blocksize mmm  Set compression block size to mmmK (default 128K)",
 "  -c, --stdout         Write all processed output to stdout (won't delete)",
+"  -C, --comment ccc    Put comment ccc in the gzip or zip header",
 "  -d, --decompress     Decompress the compressed input",
 "  -f, --force          Force overwrite, compress .gz, links, and to terminal",
 #ifndef NOZOPFLI
 "  -F  --first          Do iterations first, before block split for -11",
 #endif
 "  -h, --help           Display a help screen and quit",
+"  -H, --huffman        Use only Huffman coding for compression",
 "  -i, --independent    Compress blocks independently for damage recovery",
 #ifndef NOZOPFLI
 "  -I, --iterations n   Number of iterations for -11 optimization",
@@ -4199,6 +4494,7 @@ local char *helptext[] = {
 "  -R, --rsyncable      Input-determined block locations for rsync",
 "  -S, --suffix .sss    Use suffix .sss instead of .gz (for compression)",
 "  -t, --test           Test the integrity of the compressed input",
+"  -U, --rle            Use run-length encoding for compression",
 #ifdef PIGZ_DEBUG
 "  -v, --verbose        Provide more verbose output (-vv to debug)",
 #else
@@ -4248,6 +4544,7 @@ local int nprocs(int n) {
 // Set option defaults.
 local void defaults(void) {
     g.level = Z_DEFAULT_COMPRESSION;
+    g.strategy = Z_DEFAULT_STRATEGY;
 #ifndef NOZOPFLI
     // default zopfli options as set by ZopfliInitOptions():
     //  verbose = 0
@@ -4257,12 +4554,14 @@ local void defaults(void) {
     //  blocksplittingmax = 15
     ZopfliInitOptions(&g.zopts);
 #endif
+    g.block = 131072UL;             // 128K
+    g.shift = x2nmodp(g.block, 3);
 #ifdef NOTHREAD
     g.procs = 1;
 #else
     g.procs = nprocs(8);
 #endif
-    g.block = 131072UL;             // 128K
+    g.procs_set = 0;                // -p not yet given
     g.rsync = 0;                    // don't do rsync blocking
     g.setdict = 1;                  // initialize dictionary each thread
     g.verbosity = 1;                // normal message level
@@ -4271,6 +4570,7 @@ local void defaults(void) {
                                     // where 01 is name and 10 is time
     g.pipeout = 0;                  // don't force output to stdout
     g.sufx = ".gz";                 // compressed file suffix
+    g.comment = NULL;               // no comment
     g.decode = 0;                   // compress
     g.list = 0;                     // compress
     g.keep = 0;                     // delete input file once compressed
@@ -4282,8 +4582,9 @@ local void defaults(void) {
 
 // Long options conversion to short options.
 local char *longopts[][2] = {
-    {"LZW", "Z"}, {"lzw", "Z"}, {"ascii", "a"}, {"best", "9"}, {"bits", "Z"},
-    {"blocksize", "b"}, {"decompress", "d"}, {"fast", "1"}, {"force", "f"},
+    {"LZW", "Z"}, {"lzw", "Z"}, {"alias", "A"}, {"ascii", "a"}, {"best", "9"},
+    {"bits", "Z"}, {"blocksize", "b"}, {"decompress", "d"}, {"fast", "1"},
+    {"force", "f"}, {"comment", "C"},
 #ifndef NOZOPFLI
     {"first", "F"}, {"iterations", "I"}, {"maxsplits", "J"}, {"oneblock", "O"},
 #endif
@@ -4292,7 +4593,8 @@ local char *longopts[][2] = {
     {"processes", "p"}, {"quiet", "q"}, {"recursive", "r"}, {"rsyncable", "R"},
     {"silent", "q"}, {"stdout", "c"}, {"suffix", "S"}, {"synchronous", "Y"},
     {"test", "t"}, {"time", "M"}, {"to-stdout", "c"}, {"uncompress", "d"},
-    {"verbose", "v"}, {"version", "V"}, {"zip", "K"}, {"zlib", "z"}};
+    {"verbose", "v"}, {"version", "V"}, {"zip", "K"}, {"zlib", "z"},
+    {"huffman", "H"}, {"rle", "U"}};
 #define NLOPTS (sizeof(longopts) / (sizeof(char *) << 1))
 
 // Either new buffer size, new compression level, or new number of processes.
@@ -4328,7 +4630,7 @@ local int option(char *arg) {
 
     // if no argument or dash option, check status of get
     if (get && (arg == NULL || *arg == '-')) {
-        bad[1] = "bpSIM"[get - 1];
+        bad[1] = "bpSIJAC"[get - 1];
         throw(EINVAL, "missing parameter after %s", bad);
     }
     if (arg == NULL)
@@ -4360,9 +4662,12 @@ local int option(char *arg) {
             // options until we have the parameter
             if (get) {
                 if (get == 3)
-                    throw(EINVAL, "invalid usage: "
-                                  "-s must be followed by space");
-                break;      // allow -pnnn and -bnnn, fall to parameter code
+                    throw(EINVAL,
+                          "invalid usage: -S must be followed by space");
+                if (get == 7)
+                    throw(EINVAL,
+                          "invalid usage: -C must be followed by space");
+                break;      // allow -*nnn to fall to parameter code
             }
 
             // process next single character option or compression level
@@ -4379,19 +4684,24 @@ local int option(char *arg) {
                 if (g.level == 10 || g.level > 11)
                     throw(EINVAL, "only levels 0..9 and 11 are allowed");
                 break;
+            case 'A':  get = 6;  break;
+            case 'C':  get = 7;  break;
 #ifndef NOZOPFLI
             case 'F':  g.zopts.blocksplittinglast = 1;  break;
+#endif
+            case 'H':  g.strategy = Z_HUFFMAN_ONLY;  break;
+#ifndef NOZOPFLI
             case 'I':  get = 4;  break;
             case 'J':  get = 5;  break;
 #endif
             case 'K':  g.form = 2;  g.sufx = ".zip";  break;
             case 'L':
-                fputs(VERSION, stderr);
-                fputs("Copyright (C) 2007-2017 Mark Adler\n", stderr);
-                fputs("Subject to the terms of the zlib license.\n",
-                      stderr);
-                fputs("No warranty is provided or implied.\n", stderr);
+                puts(VERSION);
+                puts("Copyright (C) 2007-2023 Mark Adler");
+                puts("Subject to the terms of the zlib license.");
+                puts("No warranty is provided or implied.");
                 exit(0);
+                break;          // avoid warning
             case 'M':  g.headis |= 0xa;  break;
             case 'N':  g.headis = 0xf;  break;
 #ifndef NOZOPFLI
@@ -4401,17 +4711,20 @@ local int option(char *arg) {
             case 'S':  get = 3;  break;
                 // -T defined below as an alternative for -m
             case 'V':
-                fputs(VERSION, stderr);
+                puts(VERSION);
                 if (g.verbosity > 1)
-                    fprintf(stderr, "zlib %s\n", zlibVersion());
+                    printf("zlib %s\n", zlibVersion());
                 exit(0);
+                break;          // avoid warning
             case 'Y':  g.sync = 1;  break;
             case 'Z':
                 throw(EINVAL, "invalid option: LZW output not supported: %s",
                       bad);
+                break;          // avoid warning
             case 'a':
                 throw(EINVAL, "invalid option: no ascii conversion: %s",
                       bad);
+                break;          // avoid warning
             case 'b':  get = 1;  break;
             case 'c':  g.pipeout = 1;  break;
             case 'd':  if (!g.decode) g.headis >>= 2;  g.decode = 1;  break;
@@ -4427,6 +4740,7 @@ local int option(char *arg) {
             case 'q':  g.verbosity = 0;  break;
             case 'r':  g.recurse = 1;  break;
             case 't':  g.decode = 2;  break;
+            case 'U':  g.strategy = Z_RLE;  break;
             case 'v':  g.verbosity++;  break;
             case 'z':  g.form = 1;  g.sufx = ".zz";  break;
             default:
@@ -4437,13 +4751,16 @@ local int option(char *arg) {
             return 1;
     }
 
-    // process option parameter for -b, -p, -S, -I, or -J
+    // process option parameter for -b, -p, -A, -S, -I, or -J
     if (get) {
         size_t n;
 
         if (get == 1) {
             n = num(arg);
             g.block = n << 10;                  // chunk size
+#ifndef NOTHREAD
+            g.shift = x2nmodp(g.block, 3);
+#endif
             if (g.block < DICT)
                 throw(EINVAL, "block size too small (must be >= 32K)");
             if (n != g.block >> 10 ||
@@ -4455,6 +4772,7 @@ local int option(char *arg) {
         else if (get == 2) {
             n = num(arg);
             g.procs = (int)n;                   // # processes
+            g.procs_set = 1;                    // -p given explicitly
             if (g.procs < 1)
                 throw(EINVAL, "invalid number of processes: %s", arg);
             if ((size_t)g.procs != n || INBUFS(g.procs) < 1)
@@ -4474,7 +4792,11 @@ local int option(char *arg) {
             g.zopts.numiterations = (int)num(arg);  // optimize iterations
         else if (get == 5)
             g.zopts.blocksplittingmax = (int)num(arg);  // max block splits
+        else if (get == 6)
+            g.alias = arg;                      // zip name for stdin
 #endif
+        else if (get == 7)
+            g.comment = arg;                    // header comment
         get = 0;
         return 1;
     }
@@ -4486,7 +4808,7 @@ local int option(char *arg) {
 #ifndef NOTHREAD
 // handle error received from yarn function
 local void cut_yarn(int err) {
-    throw(err, err == ENOMEM ? "not enough memory" : "internal threads error");
+    throw(err, "internal threads error");
 }
 #endif
 
@@ -4511,9 +4833,11 @@ int main(int argc, char **argv) {
 #ifndef NOTHREAD
         g.in_which = -1;
 #endif
+        g.alias = "-";
         g.outf = NULL;
         g.first = 1;
         g.hname = NULL;
+        g.hcomm = NULL;
 
         // save pointer to program name for error messages
         p = strrchr(argv[0], '/');
@@ -4537,6 +4861,9 @@ int main(int argc, char **argv) {
         // check zlib version
         if (zlib_vernum() < 0x1230)
            throw(EINVAL, "zlib version less than 1.2.3");
+
+        // create CRC table, in case zlib compiled with dynamic tables
+        get_crc_table();
 
         // process user environment variable defaults in GZIP
         opts = getenv("GZIP");
@@ -4604,6 +4931,12 @@ int main(int argc, char **argv) {
             else if (option(argv[n]))   // process argument
                 argv[n] = NULL;         // remove if option
         option(NULL);                   // check for missing parameter
+
+        // Decompression is a serial inflate; the threaded write/check path only
+        // adds a full-buffer memcpy and lock hand-offs that outweigh hardware
+        // CRC32. Default -d/-t to a single thread unless -p was given.
+        if (g.decode && !g.procs_set)
+            g.procs = 1;
 
         // process command-line filenames
         done = 0;

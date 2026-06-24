@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.10)
 
 project(pigz)
 
@@ -99,6 +99,7 @@ set(PIGZ_SRCS
     zopfli/src/zopfli/hash.c
     zopfli/src/zopfli/util.c
     zopfli/src/zopfli/squeeze.c
+    zopfli/src/zopfli/symbols.c
     zopfli/src/zopfli/katajainen.c)
 
 add_executable(${PROJECT_NAME} ${PIGZ_SRCS})
