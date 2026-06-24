@@ -1,4 +1,4 @@
-.TH PIGZ 1 "December 26, 2017"
+.TH PIGZ 1 "August 19, 2023"
 .SH NAME
 pigz, unpigz \- compress or expand files
 .SH SYNOPSIS
@@ -97,7 +97,9 @@ or
 .PP
 All options on the command line are processed before any names are processed.
 If no names are provided on the command line, or if "-" is given as a name (but
-not after "--"), then the input is taken from stdin.
+not after "--"), then the input is taken from stdin. If the GZIP or PIGZ
+environment variables are set, then options are taken from their values before
+any command line options are processed, first from GZIP, then from PIGZ.
 .PP
 Compressed files can be restored to their original form using
 .I pigz -d
@@ -127,11 +129,17 @@ using the zopfli algorithm by Jyrki Alakuijala.
 The default is
 .B \-6.
 .TP
+.B -A --alias xxx
+Use xxx as the name for any --zip entry from stdin (the default name is "-").
+.TP
 .B -b --blocksize mmm
 Set compression block size to mmmK (default 128KiB).
 .TP
 .B -c --stdout --to-stdout
 Write all processed output to stdout (won't delete).
+.TP
+.B -C --comment ccc
+Include the provided comment in the gzip header or zip central file header.
 .TP
 .B -d --decompress --uncompress
 Decompress the compressed input.
@@ -141,6 +149,9 @@ Force overwrite, compress .gz, links, and to terminal.
 .TP
 .B -h --help
 Display a help screen and quit.
+.TP
+.B -H --huffman
+Compress using the Huffman-only strategy.
 .TP
 .B -i --independent
 Compress blocks independently for damage recovery.
@@ -167,7 +178,7 @@ important.
 .B -M --time
 Store or restore the modification time. -nM will store or restore the
 modification time, but not the name. Note that the order of the options is
-important.
+important. Modification times are stored only for regular files, not pipes.
 .TP
 .B -n --no-name
 Do not store or restore the file name or the modification time. This is the
@@ -197,6 +208,9 @@ Use suffix .sss instead of .gz (for compression).
 .TP
 .B -t --test
 Test the integrity of the compressed input.
+.TP
+.B -U --rle
+Compress using the run length encoding strategy.
 .TP
 .B -v --verbose
 Provide more verbose output.
@@ -228,4 +242,4 @@ This software is provided 'as-is', without any express or implied
 warranty.  In no event will the author be held liable for any damages
 arising from the use of this software.
 .PP
-Copyright (C) 2007-2017 Mark Adler <madler@alumni.caltech.edu>
+Copyright (C) 2007-2023 Mark Adler <madler@alumni.caltech.edu>
