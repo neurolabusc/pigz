@@ -678,6 +678,7 @@ local struct {
 #endif
     int rsync;              // true for rsync blocking
     int procs;              // maximum number of compression threads (>= 1)
+    int procs_set;          // true if -p was given explicitly on the command line
     int setdict;            // true to initialize dictionary in each thread
     size_t block;           // uncompressed input size per thread (>= 32K)
     crc_t shift;            // pre-calculated CRC-32 shift for length block
@@ -4560,6 +4561,7 @@ local void defaults(void) {
 #else
     g.procs = nprocs(8);
 #endif
+    g.procs_set = 0;                // -p not yet given
     g.rsync = 0;                    // don't do rsync blocking
     g.setdict = 1;                  // initialize dictionary each thread
     g.verbosity = 1;                // normal message level
@@ -4770,6 +4772,7 @@ local int option(char *arg) {
         else if (get == 2) {
             n = num(arg);
             g.procs = (int)n;                   // # processes
+            g.procs_set = 1;                    // -p given explicitly
             if (g.procs < 1)
                 throw(EINVAL, "invalid number of processes: %s", arg);
             if ((size_t)g.procs != n || INBUFS(g.procs) < 1)
@@ -4928,6 +4931,12 @@ int main(int argc, char **argv) {
             else if (option(argv[n]))   // process argument
                 argv[n] = NULL;         // remove if option
         option(NULL);                   // check for missing parameter
+
+        // Decompression is a serial inflate; the threaded write/check path only
+        // adds a full-buffer memcpy and lock hand-offs that outweigh hardware
+        // CRC32. Default -d/-t to a single thread unless -p was given.
+        if (g.decode && !g.procs_set)
+            g.procs = 1;
 
         // process command-line filenames
         done = 0;
